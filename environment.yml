@@ -1,0 +1,35 @@
+name: rsc
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Core Python
+  - python=3.10
+  - pip
+  - numpy<1.26  # Keep below 1.26 for Numba compatibility
+  - pandas
+  - scipy
+  - matplotlib
+  - scikit-learn
+  - tqdm
+  - cython
+
+  # PyTorch stack
+  - pytorch::pytorch=2.1.0  # More stable version
+  - pytorch::torchvision
+  - pytorch::torchaudio
+  
+  # Lightning
+  - conda-forge::lightning=2.1.0
+  
+  # Pip packages
+  - pip:
+    - python-box==7.0.0
+    - numba
+    - einops
+    - tensorboard
+    - rich
+    - torch-optimizer
+    - apex
