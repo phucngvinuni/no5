@@ -3,6 +3,7 @@ import math
 from typing import Dict, Optional
 import torch
 import torch.nn as nn
+import numpy as np
 from functools import partial
 from timm.models.registry import register_model
 
@@ -10,6 +11,9 @@ from model_util import (
     ViTEncoder_Van, ViTDecoder_ImageReconstruction,
     HierarchicalQuantizer, Channels, FeatureImportanceTransformer, _cfg
 )
+# --- BƯỚC 1: IMPORT MODULE KÊNH KỸ THUẬT SỐ ---
+# Giả định bạn đã tạo file digital_channel.py
+from digital_channel import transmit_and_receive_indices_batch
 
 class ViT_Reconstruction_Model(nn.Module):
     def __init__(self,
@@ -29,17 +33,15 @@ class ViT_Reconstruction_Model(nn.Module):
                  norm_layer=nn.LayerNorm,
                  init_values: float = 0.0,
                  use_learnable_pos_emb: bool = False,
-                 # Quantizer Args - Common dimension, different codebook sizes
-                 quantizer_dim: int = 512, # Common embedding dimension for both VQs
-                 bits_vq_high: int = 12,   # For high importance tokens
-                 bits_vq_low: int = 8,     # For low importance tokens
+                 quantizer_dim: int = 512,
+                 bits_vq_high: int = 12,
+                 bits_vq_low: int = 8,
                  quantizer_commitment_cost: float = 0.25,
-                 # FIM Args
                  fim_embed_dim: int = 128,
                  fim_depth: int = 2,
                  fim_num_heads: int = 4,
                  fim_drop_rate: float = 0.1,
-                 fim_routing_threshold: float = 0.6, # Threshold for routing to VQ_High
+                 fim_routing_threshold: float = 0.6,
                  **kwargs):
         super().__init__()
 
@@ -69,17 +71,18 @@ class ViT_Reconstruction_Model(nn.Module):
         
         self.quantizer_high = HierarchicalQuantizer(
             num_embeddings=2**bits_vq_high,
-            embedding_dim=quantizer_dim, # Using common quantizer_dim
+            embedding_dim=quantizer_dim,
             commitment_cost=quantizer_commitment_cost
         )
         self.quantizer_low = HierarchicalQuantizer(
             num_embeddings=2**bits_vq_low,
-            embedding_dim=quantizer_dim, # Using common quantizer_dim
+            embedding_dim=quantizer_dim,
             commitment_cost=quantizer_commitment_cost
         )
         
-        self.channel_simulator = Channels()
-        self.channel_to_decoder_proj = nn.Linear(quantizer_dim, decoder_embed_dim) # Single projection
+        # Channel simulator này giờ chỉ được dùng cho "analog proxy" trong lúc training
+        self.channel_simulator = Channels() 
+        self.channel_to_decoder_proj = nn.Linear(quantizer_dim, decoder_embed_dim)
 
         self.fim_module = FeatureImportanceTransformer(
             input_dim=encoder_embed_dim, fim_embed_dim=fim_embed_dim, fim_depth=fim_depth,
@@ -104,14 +107,16 @@ class ViT_Reconstruction_Model(nn.Module):
                 eval_snr_db: float = 30.0,
                 train_snr_db_min: float = 10.0,
                 train_snr_db_max: float = 25.0,
-                **kwargs # Catch other args like 'targets' if passed by some wrapper
+                **kwargs
                ) -> Dict[str, torch.Tensor]:
 
-        # Clean up kwargs print if desired, or make more specific
-        # if kwargs: print(f"Warning: ViT_Reconstruction_Model.forward() received unexpected kwargs: {kwargs}")
-
         B = img.shape[0]
-        is_currently_training = self.training and not _eval
+        is_training = self.training and not _eval
+        
+        if is_training:
+            current_snr_db = (torch.rand(1).item() * (train_snr_db_max - train_snr_db_min)) + train_snr_db_min
+        else:
+            current_snr_db = eval_snr_db
 
         if bm_pos is None:
             encoder_input_mask_bool = torch.zeros(
@@ -123,90 +128,91 @@ class ViT_Reconstruction_Model(nn.Module):
         # 1. Encoder
         x_encoded_tokens = self.img_encoder(img, encoder_input_mask_bool)
         
-        # 2. FIM -> raw logits -> scores for routing & VQ loss weighting
+        # 2. FIM -> Routing Mask
         fim_raw_logits = self.fim_module(x_encoded_tokens)
-        fim_scores_01_for_routing_and_loss_weighting = torch.sigmoid(fim_raw_logits) # [B, NumVisPatches, 1]
+        fim_scores = torch.sigmoid(fim_raw_logits)
+        route_to_high_mask = (fim_scores.squeeze(-1) > self.fim_routing_threshold) # [B, Np]
 
-        # 3. Project features for quantizers/channel
-        x_proj_for_channel = self.encoder_to_channel_proj(x_encoded_tokens)
-        x_proj_normalized = self.norm_before_quantizer(x_proj_for_channel) # [B, NumVisPatches, QuantizerDim]
+        # 3. Project features
+        x_proj_normalized = self.norm_before_quantizer(self.encoder_to_channel_proj(x_encoded_tokens))
 
-        # --- FIM-Gated Dual Quantization Logic (Iterating over batch) ---
-        # This assumes NumVisPatches is the same for all items if mask_ratio > 0 (due to RandomMaskingGenerator)
-        # If mask_ratio = 0, NumVisPatches = TotalPatches.
-        
-        # Squeeze FIM scores for easier masking
-        fim_scores_squeezed = fim_scores_01_for_routing_and_loss_weighting.squeeze(-1) # [B, NumVisPatches]
-        route_to_high_mask = (fim_scores_squeezed > self.fim_routing_threshold) # [B, NumVisPatches] boolean
+        # --- BƯỚC 4: LƯỢNG TỬ HÓA VÀ TRUYỀN TIN ---
+        if is_training:
+            # --- TRAINING PATH (ANALOG PROXY) ---
+            final_tokens_for_channel = torch.zeros_like(x_proj_normalized)
+            total_vq_loss = torch.tensor(0.0, device=img.device)
+            
+            # Xử lý các token quan trọng
+            high_tokens_mask = route_to_high_mask
+            if high_tokens_mask.any():
+                q_high, vq_loss_high, _, _ = self.quantizer_high(x_proj_normalized[high_tokens_mask])
+                final_tokens_for_channel[high_tokens_mask] = q_high
+                # Weight the VQ loss by FIM scores
+                total_vq_loss += (vq_loss_high * fim_scores.squeeze(-1)[high_tokens_mask]).mean()
 
-        final_tokens_for_channel = torch.zeros_like(x_proj_normalized)
-        
-        accumulated_weighted_vq_loss_value = 0.0
-        num_tokens_actually_quantized_total = 0
+            # Xử lý các token không quan trọng
+            low_tokens_mask = ~route_to_high_mask
+            if low_tokens_mask.any():
+                q_low, vq_loss_low, _, _ = self.quantizer_low(x_proj_normalized[low_tokens_mask])
+                final_tokens_for_channel[low_tokens_mask] = q_low
+                # Weight the VQ loss by (1 - FIM scores) could be an option, or just the scores
+                total_vq_loss += (vq_loss_low * fim_scores.squeeze(-1)[low_tokens_mask]).mean()
+            
+            self.current_vq_loss = total_vq_loss / B
+            
+            # Truyền VECTORS qua kênh ANALOG mô phỏng
+            noise_power_variance = 10**(-current_snr_db / 10.0)
+            tokens_after_channel = self.channel_simulator.Rayleigh(final_tokens_for_channel, noise_power_variance)
 
-        for i in range(B): # Iterate over batch samples
-            sample_x_proj_norm = x_proj_normalized[i] # [NumVisPatches, QuantizerDim]
-            sample_route_high = route_to_high_mask[i]   # [NumVisPatches] boolean
-            sample_fim_scores = fim_scores_squeezed[i]  # [NumVisPatches] float scores
-
-            # --- High Importance Tokens ---
-            tokens_for_high_vq_i = sample_x_proj_norm[sample_route_high] # [N_high_i, QuantizerDim]
-            if tokens_for_high_vq_i.numel() > 0:
-                fim_scores_high_i = sample_fim_scores[sample_route_high] # [N_high_i]
-                
-                q_high_st_i, pt_vq_loss_high_i, _, _ = self.quantizer_high(
-                    tokens_for_high_vq_i.unsqueeze(0), return_per_token_loss=True # Pass as batch of 1
-                ) # pt_vq_loss_high_i: [1, N_high_i]
-                
-                weighted_vq_loss_high_i = (fim_scores_high_i * pt_vq_loss_high_i.squeeze(0)).sum()
-                accumulated_weighted_vq_loss_value += weighted_vq_loss_high_i.item()
-                num_tokens_actually_quantized_total += tokens_for_high_vq_i.size(0)
-                final_tokens_for_channel[i, sample_route_high] = q_high_st_i.squeeze(0)
-
-            # --- Low Importance Tokens ---
-            tokens_for_low_vq_i = sample_x_proj_norm[~sample_route_high] # [N_low_i, QuantizerDim]
-            if tokens_for_low_vq_i.numel() > 0:
-                fim_scores_low_i = sample_fim_scores[~sample_route_high] # [N_low_i]
-
-                q_low_st_i, pt_vq_loss_low_i, _, _ = self.quantizer_low(
-                    tokens_for_low_vq_i.unsqueeze(0), return_per_token_loss=True # Pass as batch of 1
-                ) # pt_vq_loss_low_i: [1, N_low_i]
-
-                weighted_vq_loss_low_i = (fim_scores_low_i * pt_vq_loss_low_i.squeeze(0)).sum()
-                accumulated_weighted_vq_loss_value += weighted_vq_loss_low_i.item()
-                num_tokens_actually_quantized_total += tokens_for_low_vq_i.size(0)
-                final_tokens_for_channel[i, ~sample_route_high] = q_low_st_i.squeeze(0)
-        
-        if num_tokens_actually_quantized_total > 0:
-            self.current_vq_loss = torch.tensor(accumulated_weighted_vq_loss_value / num_tokens_actually_quantized_total, device=img.device)
         else:
-            self.current_vq_loss = torch.tensor(0.0, device=img.device)
-        # --- End Dual VQ Logic ---
+            # --- EVALUATION PATH (DIGITAL PIPELINE) ---
+            # Chỉ hoạt động ở batch size = 1 để đơn giản hóa, hoặc cần sửa transmit_and_receive_indices_batch
+            if B > 1:
+                raise NotImplementedError("Digital evaluation path currently supports batch size of 1.")
 
-        # 4. Channel Simulation
-        if is_currently_training:
-            current_snr_db_tensor = torch.rand(1, device=img.device) * (train_snr_db_max - train_snr_db_min) + train_snr_db_min
-        else:
-            current_snr_db_tensor = torch.tensor(eval_snr_db, device=img.device)
-        noise_power_variance = 10**(-current_snr_db_tensor / 10.0)
-        tokens_after_channel = self.channel_simulator.Rayleigh(final_tokens_for_channel, noise_power_variance.item())
+            # Lấy chỉ số và số bit cho từng token
+            indices_high, indices_low = self.quantizer_high.get_indices(x_proj_normalized[route_to_high_mask]), self.quantizer_low.get_indices(x_proj_normalized[~route_to_high_mask])
+            
+            # Tạo một tensor chứa chỉ số và một tensor chứa số bit tương ứng
+            all_indices = torch.zeros(B, x_proj_normalized.size(1), dtype=torch.long, device=img.device)
+            bits_per_index = torch.zeros(B, x_proj_normalized.size(1), dtype=torch.long, device=img.device)
+            
+            bits_high = int(np.log2(self.quantizer_high.num_embeddings))
+            bits_low = int(np.log2(self.quantizer_low.num_embeddings))
 
-        # 5. Decoder
+            all_indices[route_to_high_mask] = indices_high
+            all_indices[~route_to_high_mask] = indices_low
+            bits_per_index[route_to_high_mask] = bits_high
+            bits_per_index[~route_to_high_mask] = bits_low
+
+            # Truyền INDICES qua kênh DIGITAL mô phỏng
+            recovered_indices = transmit_and_receive_indices_batch(all_indices, bits_per_index, snr_db=current_snr_db)
+
+            # Tra cứu sổ mã để lấy lại vectors
+            final_tokens_for_channel = torch.zeros_like(x_proj_normalized)
+            for i in range(B):
+                rec_idx_i = recovered_indices[i]
+                route_high_i = route_to_high_mask[i]
+                final_tokens_for_channel[i, route_high_i] = self.quantizer_high.embedding(rec_idx_i[route_high_i])
+                final_tokens_for_channel[i, ~route_high_i] = self.quantizer_low.embedding(rec_idx_i[~route_high_i])
+
+            tokens_after_channel = final_tokens_for_channel
+            self.current_vq_loss = torch.tensor(0.0, device=img.device) # Không có VQ loss khi eval
+
+        # 5. Decoder (chung cho cả hai luồng)
         x_for_decoder_input = self.channel_to_decoder_proj(tokens_after_channel)
         
         reconstructed_image = self.img_decoder(
-            x_vis_tokens=x_for_decoder_input, # These are features for visible encoder patches
-            encoder_mask_boolean=encoder_input_mask_bool, # Mask indicating which original patches were fed to encoder
+            x_vis_tokens=x_for_decoder_input,
+            encoder_mask_boolean=encoder_input_mask_bool,
             full_image_num_patches_h=self.full_image_num_patches_h,
             full_image_num_patches_w=self.full_image_num_patches_w,
-            ids_restore_if_mae=None # For mask_ratio=0, this is fine.
-                                    # If mask_ratio > 0, MAE-style decoder would need ids_restore.
         )
 
         output_dict = {
             'reconstructed_image': reconstructed_image,
             'vq_loss': self.current_vq_loss,
-            'fim_importance_scores': fim_raw_logits # Pass RAW LOGITS for FIM training loss
+            'fim_importance_scores': fim_raw_logits
         }
         return output_dict
 
