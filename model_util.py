@@ -8,12 +8,8 @@ import torch
 import torch.nn as nn
 from functools import partial
 import torch.nn.functional as F
+from digital_channel import transmit_indices, receive_indices 
 
-# --- (DropPath, Mlp, Attention, Block, PatchEmbed, get_sinusoid_encoding_table, ViTEncoder_Van
-#       HierarchicalQuantizer, Channels - should be the same as the last correct versions) ---
-# For brevity, I'm only showing ViTDecoder_ImageReconstruction with the CNN head.
-# Ensure other classes are correctly defined as in the previous "full code for model_util.py"
-# where HierarchicalQuantizer used nn.Embedding.
 
 def _cfg(url='', **kwargs): # Keep _cfg if model.py uses it
     return {
@@ -362,7 +358,7 @@ class HierarchicalQuantizer(nn.Module):
             self.hier_init_done = True; return
 
 
-        # print(f"HierarchicalQuantizer: Initializing with {num_samples} samples, targeting {self.num_embeddings} embeddings via fcluster.")
+        print(f"HierarchicalQuantizer: Initializing with {num_samples} samples, targeting {self.num_embeddings} embeddings via fcluster.")
         Z = scipy_linkage_func(x_flat_cpu_np, method=self.linkage)
         
         # Ensure n_clusters for fcluster is valid
@@ -385,7 +381,7 @@ class HierarchicalQuantizer(nn.Module):
                 centroids[centroid_idx] = x_flat_cpu_np[np.random.randint(num_samples)]
 
         if num_actual_clusters_formed < self.num_embeddings:
-            # print(f"  Hierarchical clustering formed {num_actual_clusters_formed} distinct centroids. Expected {self.num_embeddings}. Filling remaining...")
+            print(f"  Hierarchical clustering formed {num_actual_clusters_formed} distinct centroids. Expected {self.num_embeddings}. Filling remaining...")
             num_to_fill_additionally = self.num_embeddings - num_actual_clusters_formed
             if num_samples > 0:
                 fill_indices = np.random.choice(num_samples, num_to_fill_additionally, replace=(num_samples < num_to_fill_additionally))
@@ -398,56 +394,59 @@ class HierarchicalQuantizer(nn.Module):
         print("HierarchicalQuantizer: Centroids initialized using hierarchical clustering.")
         self.hier_init_done = True
 
+    def get_indices(self, x_flat: torch.Tensor) -> torch.Tensor:
+        """Chỉ tìm và trả về các chỉ số."""
+        distances_sq = torch.sum(x_flat**2, dim=1, keepdim=True) + \
+                       torch.sum(self.embedding.weight**2, dim=1) - \
+                       2 * torch.matmul(x_flat, self.embedding.weight.t())
+        return torch.argmin(distances_sq, dim=1)
 
-    def forward(self, x: torch.Tensor, return_per_token_loss: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, return_per_token_loss: bool = False):
         original_shape = x.shape
-        B, N_tokens, D = original_shape
-        assert D == self.embedding_dim, f"Input dim {D} != embedding_dim {self.embedding_dim}"
-        x_flat = x.reshape(-1, self.embedding_dim)
+        B_times_N, D = x.view(-1, self.embedding_dim).shape
+        x_flat = x.view(-1, self.embedding_dim)
 
         if self.hier_init_requested and not self.hier_init_done and self.training and x_flat.shape[0] > 1:
             self._initialize_centroids_hierarchical(x_flat.detach().cpu().numpy())
 
+        # =================================================================
+        # === PHẦN SỬA LỖI: ĐẢM BẢO ĐOẠN CODE NÀY TỒN TẠI VÀ ĐƯỢC CHẠY ===
+        # Tính toán khoảng cách Euclidean bình phương giữa mỗi vector input và tất cả các vector trong sổ mã
         distances_sq = (torch.sum(x_flat**2, dim=1, keepdim=True) +
                         torch.sum(self.embedding.weight**2, dim=1) -
                         2 * torch.matmul(x_flat, self.embedding.weight.t()))
-        distances_sq = torch.clamp(distances_sq, min=0.0) # Ensure non-negative distances
+        # =================================================================
+
+        # Tìm chỉ số của vector gần nhất
         encoding_indices = torch.argmin(distances_sq, dim=1)
-
         quantized_flat = self.embedding(encoding_indices)
+        
+        # --- Tính VQ Loss và sử dụng Straight-Through Estimator (STE) ---
+        
+        # Loss để cập nhật sổ mã (codebook)
+        codebook_loss = F.mse_loss(quantized_flat, x_flat.detach(), reduction='none')
+        
+        # Loss để cập nhật encoder
+        commitment_loss = F.mse_loss(x_flat, quantized_flat.detach(), reduction='none')
+
+        # Loss tổng hợp cho VQ
+        per_token_total_vq_loss = codebook_loss + self.commitment_cost * commitment_loss
+        
+        # Áp dụng STE: luồng tiến dùng giá trị lượng tử hóa, luồng ngược dùng gradient của giá trị gốc
         quantized_output_tokens = quantized_flat.view(original_shape)
+        quantized_output_tokens_st = x + (quantized_output_tokens - x).detach()
 
-        # --- VQ Loss Calculation & Debugging ---
-        # Term 1 (often called codebook loss or e_k in some papers): moves embedding vectors
-        codebook_loss_per_token = F.mse_loss(quantized_flat, x_flat.detach(), reduction='none').mean(dim=-1).view(B, N_tokens)
-        
-        # Term 2 (often called commitment loss or e_c in some papers): moves encoder output
-        commitment_loss_per_token = F.mse_loss(x_flat, quantized_flat.detach(), reduction='none').mean(dim=-1).view(B, N_tokens)
-
-        if self.training and torch.rand(1).item() < 0.005: # Print for ~0.5% of training batches
-            print(f"VQ_DEBUG (HierarchicalQuantizer):")
-            print(f"  x_flat min: {x_flat.min().item():.4f}, max: {x_flat.max().item():.4f}, mean: {x_flat.mean().item():.4f}")
-            print(f"  quantized_flat min: {quantized_flat.min().item():.4f}, max: {quantized_flat.max().item():.4f}, mean: {quantized_flat.mean().item():.4f}")
-            print(f"  codebook_loss_per_token (raw) min: {codebook_loss_per_token.min().item():.4f}, max: {codebook_loss_per_token.max().item():.4f}, mean: {codebook_loss_per_token.mean().item():.4f}")
-            print(f"  commitment_loss_per_token (raw) min: {commitment_loss_per_token.min().item():.4f}, max: {commitment_loss_per_token.max().item():.4f}, mean: {commitment_loss_per_token.mean().item():.4f}")
-            if codebook_loss_per_token.min().item() < -1e-6 or commitment_loss_per_token.min().item() < -1e-6: # Check with a small tolerance for float errors
-                print("  ERROR: Raw VQ loss component is negative!")
-        # --- End VQ Loss Debugging ---
-
-        # Standard VQ-VAE loss: L_codebook + beta * L_commitment
-        per_token_total_vq_loss = codebook_loss_per_token + self.commitment_cost * commitment_loss_per_token
-        
-        mean_vq_total_loss = per_token_total_vq_loss.mean()
-        quantized_output_tokens_st = x + (quantized_output_tokens - x).detach() # Straight-through
-
+        # Tính perplexity (độ phức tạp của việc sử dụng sổ mã)
         encodings_one_hot = F.one_hot(encoding_indices, self.num_embeddings).float()
-        avg_probs = torch.mean(encodings_one_hot.view(-1, self.num_embeddings), dim=0) # Ensure flat before mean for perplexity
+        avg_probs = torch.mean(encodings_one_hot, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
 
         if return_per_token_loss:
-            return quantized_output_tokens_st, per_token_total_vq_loss, perplexity, encoding_indices
+            # Trả về loss trên từng token nếu cần cho FIM-weighting
+            return quantized_output_tokens_st, per_token_total_vq_loss.mean(-1).view(original_shape[0], -1), perplexity, encoding_indices
         else:
-            return quantized_output_tokens_st, mean_vq_total_loss, perplexity, encoding_indices
+            # Trả về loss trung bình
+            return quantized_output_tokens_st, per_token_total_vq_loss.mean(), perplexity, encoding_indices
 class Channels(nn.Module):
     # ... (Keep the Channels class exactly as it was in the previous full code response) ...
     def __init__(self): super().__init__()
