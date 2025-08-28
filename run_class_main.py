@@ -1,7 +1,7 @@
 # run_class_main.py
 import sys
 import os
-
+import torch.multiprocessing as mp
 # --- Ensure local modules are prioritized ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
@@ -25,18 +25,16 @@ import engine1
 from base_args import get_args
 import datasets
 import optim_factory
+import csv
 
 NativeScaler = utils.NativeScalerWithGradNormCount
 
-# --- LPIPS Import and Global Variable ---
 try:
     import lpips
     LPIPS_AVAILABLE = True
 except ImportError:
     LPIPS_AVAILABLE = False
-    # This print will happen once when the script starts
     print("Warning: lpips library not found. Perceptual loss will be skipped. `pip install lpips`")
-# --- End LPIPS ---
 
 
 def seed_initial(seed=0, rank=0):
@@ -51,11 +49,10 @@ def seed_initial(seed=0, rank=0):
 
 
 def main(args):
-    utils.init_distributed_mode(args) # Sets args.distributed, args.rank, etc.
+    utils.init_distributed_mode(args)
     device = torch.device(args.device)
     seed_initial(seed=args.seed, rank=utils.get_rank())
 
-    # --- LPIPS Criterion Initialization ---
     lpips_criterion_instance = None
     if LPIPS_AVAILABLE and hasattr(args, 'lpips_loss_weight') and args.lpips_loss_weight > 0:
         try:
@@ -69,15 +66,11 @@ def main(args):
 
 
     print(f"Creating SemCom model: {args.model}")
-    semcom_model = utils.get_model(args) # This now happens after model.py is imported
+    semcom_model = utils.get_model(args)
 
-    # --- Calculate window_size (for dataset's RandomMaskingGenerator) ---
-    # This logic should ideally use args.patch_size directly if model is configurable
-    # Or derive from a loaded model if --resume is used with a different patch_size
-    # For simplicity, assuming args.patch_size is the definitive source for new runs.
     if args.patch_size > 0:
         args.window_size = (args.input_size // args.patch_size, args.input_size // args.patch_size)
-    else: # Fallback, though patch_size=0 is unlikely
+    else:
         args.window_size = (args.input_size // 16, args.input_size // 16)
         print(f"Warning: args.patch_size is not positive. Using default 16x16 assumption for window_size.")
     print(f"Derived SemCom Patch Grid (window_size): {args.window_size} for input_size {args.input_size} using patch_size {args.patch_size}")
@@ -103,8 +96,6 @@ def main(args):
                 print(f"INFO: load_custom_checkpoint reported success. args.start_epoch is now: {args.start_epoch}")
             else:
                 print(f"WARNING: load_custom_checkpoint reported failure for {args.resume}. Training may start from scratch or with partial load.")
-                # If only model weights loaded but not optimizer/epoch, it's a partial resume.
-                # Setting args.start_epoch = 0 ensures LR scheduler restarts if optimizer didn't load.
                 if not ('optimizer' in torch.load(args.resume, map_location='cpu') and 'epoch' in torch.load(args.resume, map_location='cpu')):
                      args.start_epoch = 0
         else:
@@ -144,15 +135,20 @@ def main(args):
 
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=args.pin_mem,
-        drop_last=True, collate_fn=datasets.yolo_collate_fn
+        num_workers=args.num_workers, pin_memory=False,
+        drop_last=True, collate_fn=datasets.yolo_collate_fn, persistent_workers=False
     )
     dataloader_val = None
     if valset and len(valset) > 0:
+        print(f"INFO: Validation dataloader will use batch_size=1 for digital pipeline evaluation.")
         dataloader_val = torch.utils.data.DataLoader(
-            valset, batch_size=args.batch_size, shuffle=False,
-            num_workers=args.num_workers, pin_memory=args.pin_mem,
-            drop_last=False, collate_fn=datasets.yolo_collate_fn
+            valset, 
+            batch_size=1, # <--- SỬA THÀNH 1 Ở ĐÂY
+            shuffle=False,
+            num_workers=args.num_workers, 
+            pin_memory=args.pin_mem,
+            drop_last=False, 
+            collate_fn=datasets.yolo_collate_fn
         )
     else:
         print("Validation dataset is empty or could not be loaded. Validation will be skipped.")
@@ -174,114 +170,173 @@ def main(args):
 
     # --- Evaluation Only Mode ---
     if args.eval:
-        print("Evaluation mode selected (args.eval=True).")
+        print(f"Evaluation mode selected (args.eval=True) for SNR = {args.snr_db_eval} dB.")
+        
+        # Tạo thư mục visualize nếu cần
         eval_viz_dir_path = Path(args.eval_viz_output_dir) / f"eval_run_snr{args.snr_db_eval}"
         eval_viz_dir_path.mkdir(parents=True, exist_ok=True)
-        if dataloader_val is None: print("  Validation dataloader not available. Skipping eval."); exit(0)
+
+        if dataloader_val is None: 
+            print("  Validation dataloader not available. Skipping eval.")
+            exit(0)
         
         print("  Starting evaluation-only run...")
         test_stats = engine1.evaluate_semcom_with_yolo(
             semcom_net=semcom_model, yolo_model=yolo_model, dataloader=dataloader_val,
             device=device, reconstruction_criterion=base_reconstruction_criterion,
             fim_criterion=fim_criterion, lpips_criterion=lpips_criterion_instance, args=args,
-            current_epoch_num="eval_only", viz_output_dir=str(eval_viz_dir_path)
+            current_epoch_num=f"eval_snr_{args.snr_db_eval}", 
+            viz_output_dir=str(eval_viz_dir_path)
         )
         print(f"\n--- Final Evaluation Results (SNR: {args.snr_db_eval} dB) ---")
         for key, val in test_stats.items():
-            if isinstance(val, float): print(f"  {key}: {val:.4f}")
-            else: print(f"  {key}: {val}")
-        sys.stdout.flush(); exit(0)
+            if isinstance(val, (float, int)): 
+                print(f"  {key}: {val:.4f}")
+        
+        # ==========================================================
+        # === [!] BẮT ĐẦU LOGIC GHI FILE CSV MỚI [!] ===
+        # ==========================================================
+        if args.csv_log_file:
+            print(f"  Logging results to {args.csv_log_file}...")
+            # Trích xuất các metric cần thiết, sử dụng .get() để tránh lỗi nếu thiếu key
+            snr = args.snr_db_eval
+            psnr = test_stats.get('psnr', 'N/A')
+            ssim = test_stats.get('ssim', 'N/A')
+            map_50 = test_stats.get('map_50', 'N/A') # torchmetrics trả về key 'map_50'
+            map_total = test_stats.get('map', 'N/A')   # và 'map'
 
-    # --- Training Loop ---
-    print(f"Start training SemCom with FIM for image reconstruction for {args.epochs} epochs")
-    max_psnr_eval = 0.0; best_map_50_eval = 0.0
-    start_time_total_train = time.time()
-
-    for epoch in range(args.start_epoch, args.epochs):
-        epoch_start_time = time.time()
-        print(f"\n--- Starting Training Epoch {epoch}/{args.epochs-1} ---")
-        # if args.distributed: trainloader.sampler.set_epoch(epoch) # For DDP
-
-        semcom_model.train()
-        train_stats = engine1.train_epoch_semcom_reconstruction(
-            model=semcom_model, base_reconstruction_criterion=base_reconstruction_criterion,
-            fim_criterion=fim_criterion, lpips_criterion=lpips_criterion_instance,
-            data_loader=trainloader, optimizer=optimizer, device=device, epoch=epoch,
-            loss_scaler=loss_scaler, args=args, max_norm=args.clip_grad,
-            start_steps=epoch * num_training_steps_per_epoch,
-            lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
-            update_freq=args.update_freq, print_freq=args.save_freq # Adjusted print_freq to save_freq
-        )
-        epoch_duration = time.time() - epoch_start_time
-        print(f"--- Epoch {epoch} Training Finished in {epoch_duration:.2f}s ---")
-        print_train_stat_str = f"  Avg Train TotalL: {train_stats.get('total_loss',0):.3f} (" \
-                               f"Rec: {train_stats.get('rec_loss',0):.3f}, " \
-                               f"VQ: {train_stats.get('vq_loss',0):.3f}, " \
-                               f"FIM: {train_stats.get('fim_loss',0):.3f}"
-        if lpips_criterion_instance and args.lpips_loss_weight > 0: # Check if LPIPS was active
-            print_train_stat_str += f", LPIPS: {train_stats.get('lpips_loss',0):.3f}"
-        print_train_stat_str += f") PSNR: {train_stats.get('psnr',0):.2f}, SSIM: {train_stats.get('ssim',0):.3f}"
-        print(print_train_stat_str)
-
-        eval_stats_exist_this_epoch = False # Flag to check if eval_stats were computed
-        current_eval_stats = {}
-
-        # Perform evaluation periodically
-        if dataloader_val is not None and ((epoch + 1) % args.save_freq == 0 or epoch + 1 == args.epochs):
-            print(f"\n--- Evaluating at end of Epoch {epoch} (Eval SNR: {args.snr_db_eval} dB) ---")
-            current_epoch_viz_dir_path = Path(args.eval_viz_output_dir) / f"epoch_{epoch}_snr{args.snr_db_eval:.0f}"
-            current_epoch_viz_dir_path.mkdir(parents=True, exist_ok=True)
+            # Xác định chế độ ghi file: 'a' (append) hoặc 'w' (write)
+            file_mode = 'a' if args.append_csv else 'w'
             
-            current_eval_stats = engine1.evaluate_semcom_with_yolo( # Store eval_stats
-                semcom_net=semcom_model, yolo_model=yolo_model, dataloader=dataloader_val,
-                device=device, reconstruction_criterion=base_reconstruction_criterion,
-                fim_criterion=fim_criterion, lpips_criterion=lpips_criterion_instance, args=args,
-                current_epoch_num=epoch, viz_output_dir=str(current_epoch_viz_dir_path)
+            # Kiểm tra xem file đã tồn tại chưa để quyết định ghi header
+            file_exists = os.path.isfile(args.csv_log_file)
+
+            try:
+                with open(args.csv_log_file, mode=file_mode, newline='') as csv_file:
+                    # Các cột trong file CSV
+                    fieldnames = ['SNR_dB', 'PSNR', 'SSIM', 'mAP_50', 'mAP']
+                    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+
+                    # Chỉ ghi header nếu file mới được tạo (hoặc không ở chế độ append)
+                    if not file_exists or file_mode == 'w':
+                        writer.writeheader()
+                    
+                    # Ghi dòng dữ liệu cho SNR hiện tại
+                    writer.writerow({
+                        'SNR_dB': f"{snr:.1f}",
+                        'PSNR': f"{psnr:.4f}" if isinstance(psnr, float) else psnr,
+                        'SSIM': f"{ssim:.4f}" if isinstance(ssim, float) else ssim,
+                        'mAP_50': f"{map_50:.4f}" if isinstance(map_50, float) else map_50,
+                        'mAP': f"{map_total:.4f}" if isinstance(map_total, float) else map_total
+                    })
+                print(f"  Successfully wrote results for SNR {snr} to CSV.")
+            except Exception as e:
+                print(f"  ERROR: Could not write to CSV file {args.csv_log_file}. Error: {e}")
+
+        # ==========================================================
+        # === [!] KẾT THÚC LOGIC GHI FILE CSV [!] ===
+        # ==========================================================
+
+        sys.stdout.flush()
+        exit(0) # Vẫn thoát sau khi hoàn thành một lần eval
+
+    if not args.eval:
+        # --- Training Loop ---
+        print(f"Start training SemCom with FIM for image reconstruction for {args.epochs} epochs")
+        max_psnr_eval = 0.0; best_map_50_eval = 0.0
+        start_time_total_train = time.time()
+
+        for epoch in range(args.start_epoch, args.epochs):
+            epoch_start_time = time.time()
+            print(f"\n--- Starting Training Epoch {epoch}/{args.epochs-1} ---")
+        
+
+            semcom_model.train()
+            train_stats = engine1.train_epoch_semcom_reconstruction(
+                model=semcom_model, base_reconstruction_criterion=base_reconstruction_criterion,
+                fim_criterion=fim_criterion, lpips_criterion=lpips_criterion_instance,
+                data_loader=trainloader, optimizer=optimizer, device=device, epoch=epoch,
+                loss_scaler=loss_scaler, args=args, max_norm=args.clip_grad,
+                start_steps=epoch * num_training_steps_per_epoch,
+                lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
+                update_freq=args.update_freq, print_freq=args.save_freq # Adjusted print_freq to save_freq
             )
-            eval_stats_exist_this_epoch = True # Mark that eval_stats are available
-            
-            current_psnr_value = current_eval_stats.get('psnr', -float('inf')) # Use -inf for correct comparison
-            current_map_50_value = current_eval_stats.get('map_50', -float('inf')) # Use -inf
+            epoch_duration = time.time() - epoch_start_time
+            print(f"--- Epoch {epoch} Training Finished in {epoch_duration:.2f}s ---")
+            print_train_stat_str = f"  Avg Train TotalL: {train_stats.get('total_loss',0):.3f} (" \
+                                f"Rec: {train_stats.get('rec_loss',0):.3f}, " \
+                                f"VQ: {train_stats.get('vq_loss',0):.3f}, " \
+                                f"FIM: {train_stats.get('fim_loss',0):.3f}"
+            if lpips_criterion_instance and args.lpips_loss_weight > 0: # Check if LPIPS was active
+                print_train_stat_str += f", LPIPS: {train_stats.get('lpips_loss',0):.3f}"
+            print_train_stat_str += f") PSNR: {train_stats.get('psnr',0):.2f}, SSIM: {train_stats.get('ssim',0):.3f}"
+            print(print_train_stat_str)
 
-            print_eval_stat_str = f"  Epoch {epoch} Eval: PSNR: {current_psnr_value:.2f}, SSIM: {current_eval_stats.get('ssim',0.0):.4f}"
-            if lpips_criterion_instance and hasattr(args, 'lpips_loss_weight') and args.lpips_loss_weight > 0:
-                print_eval_stat_str += f", LPIPS: {current_eval_stats.get('lpips_loss',0.0):.4f}"
-            if yolo_model and engine1.TORCHMETRICS_AVAILABLE:
-                print_eval_stat_str += f", mAP: {current_eval_stats.get('map',0.0):.4f}, mAP@50: {current_map_50_value:.4f}"
-            print(print_eval_stat_str)
+            eval_stats_exist_this_epoch = False # Flag to check if eval_stats were computed
+            current_eval_stats = {}
 
-            if current_psnr_value > max_psnr_eval:
-                max_psnr_eval = current_psnr_value
-                print(f"  *** New best PSNR on eval: {max_psnr_eval:.2f} at epoch {epoch} ***")
-                if args.output_dir and args.save_ckpt:
-                    utils.save_model(args=args, model=semcom_model, model_without_ddp=model_without_ddp,
-                               optimizer=optimizer, loss_scaler=loss_scaler, epoch="best_psnr")
-            
-            if yolo_model and engine1.TORCHMETRICS_AVAILABLE and current_map_50_value > best_map_50_eval:
-                best_map_50_eval = current_map_50_value
-                print(f"  *** New best mAP@50 on eval: {best_map_50_eval:.4f} at epoch {epoch} ***")
-                if args.output_dir and args.save_ckpt:
-                     utils.save_model(args=args, model=semcom_model, model_without_ddp=model_without_ddp,
-                                 optimizer=optimizer, loss_scaler=loss_scaler, epoch="best_map")
-            print("-------------------------------------------------------------------\n")
-            sys.stdout.flush()
+            # Perform evaluation periodically
+            if dataloader_val is not None and ((epoch + 1) % args.save_freq == 0 or epoch + 1 == args.epochs):
+                print(f"\n--- Evaluating at end of Epoch {epoch} (Eval SNR: {args.snr_db_eval} dB) ---")
+                current_epoch_viz_dir_path = Path(args.eval_viz_output_dir) / f"epoch_{epoch}_snr{args.snr_db_eval:.0f}"
+                current_epoch_viz_dir_path.mkdir(parents=True, exist_ok=True)
+                
+                current_eval_stats = engine1.evaluate_semcom_with_yolo( # Store eval_stats
+                    semcom_net=semcom_model, yolo_model=yolo_model, dataloader=dataloader_val,
+                    device=device, reconstruction_criterion=base_reconstruction_criterion,
+                    fim_criterion=fim_criterion, lpips_criterion=lpips_criterion_instance, args=args,
+                    current_epoch_num=epoch, viz_output_dir=str(current_epoch_viz_dir_path)
+                )
+                eval_stats_exist_this_epoch = True # Mark that eval_stats are available
+                
+                current_psnr_value = current_eval_stats.get('psnr', -float('inf')) # Use -inf for correct comparison
+                current_map_50_value = current_eval_stats.get('map_50', -float('inf')) # Use -inf
 
-        # Save regular checkpoint (after potential best model saves)
-        if args.output_dir and args.save_ckpt and ((epoch + 1) % args.save_freq == 0 or epoch + 1 == args.epochs):
-            utils.save_model( # This call was correctly here for numbered checkpoints
-                args=args, model=semcom_model, model_without_ddp=model_without_ddp,
-                optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch
-            )
+                print_eval_stat_str = f"  Epoch {epoch} Eval: PSNR: {current_psnr_value:.2f}, SSIM: {current_eval_stats.get('ssim',0.0):.4f}"
+                if lpips_criterion_instance and hasattr(args, 'lpips_loss_weight') and args.lpips_loss_weight > 0:
+                    print_eval_stat_str += f", LPIPS: {current_eval_stats.get('lpips_loss',0.0):.4f}"
+                if yolo_model and engine1.TORCHMETRICS_AVAILABLE:
+                    print_eval_stat_str += f", mAP: {current_eval_stats.get('map',0.0):.4f}, mAP@50: {current_map_50_value:.4f}"
+                print(print_eval_stat_str)
+
+                if current_psnr_value > max_psnr_eval:
+                    max_psnr_eval = current_psnr_value
+                    print(f"  *** New best PSNR on eval: {max_psnr_eval:.2f} at epoch {epoch} ***")
+                    if args.output_dir and args.save_ckpt:
+                        utils.save_model(args=args, model=semcom_model, model_without_ddp=model_without_ddp,
+                                optimizer=optimizer, loss_scaler=loss_scaler, epoch="best_psnr")
+                
+                if yolo_model and engine1.TORCHMETRICS_AVAILABLE and current_map_50_value > best_map_50_eval:
+                    best_map_50_eval = current_map_50_value
+                    print(f"  *** New best mAP@50 on eval: {best_map_50_eval:.4f} at epoch {epoch} ***")
+                    if args.output_dir and args.save_ckpt:
+                        utils.save_model(args=args, model=semcom_model, model_without_ddp=model_without_ddp,
+                                    optimizer=optimizer, loss_scaler=loss_scaler, epoch="best_map")
+                print("-------------------------------------------------------------------\n")
+                sys.stdout.flush()
+
+            # Save regular checkpoint (after potential best model saves)
+            if args.output_dir and args.save_ckpt and ((epoch + 1) % args.save_freq == 0 or epoch + 1 == args.epochs):
+                utils.save_model( # This call was correctly here for numbered checkpoints
+                    args=args, model=semcom_model, model_without_ddp=model_without_ddp,
+                    optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch
+                )
 
 
-    total_training_duration = time.time() - start_time_total_train
-    total_time_str = str(datetime.timedelta(seconds=int(total_training_duration)))
-    print(f'Total Training time for SemCom: {total_time_str}')
-    print(f'Best PSNR achieved on validation: {max_psnr_eval:.2f} dB')
-    print(f'Best mAP@50 achieved on validation: {best_map_50_eval:.4f}')
-    sys.stdout.flush()
+        total_training_duration = time.time() - start_time_total_train
+        total_time_str = str(datetime.timedelta(seconds=int(total_training_duration)))
+        print(f'Total Training time for SemCom: {total_time_str}')
+        print(f'Best PSNR achieved on validation: {max_psnr_eval:.2f} dB')
+        print(f'Best mAP@50 achieved on validation: {best_map_50_eval:.4f}')
+        sys.stdout.flush()
 
 if __name__ == '__main__':
+    try:
+        mp.set_start_method('spawn', force=True)
+        print("INFO: Multiprocessing start method set to 'spawn'.")
+    except RuntimeError:
+        print("INFO: Multiprocessing start method already set.")
+        pass
     opts = get_args()
     if not hasattr(opts, 'lpips_loss_weight'):
         print("Warning: --lpips_loss_weight not defined in args. Defaulting to 0.0 (LPIPS disabled).")
